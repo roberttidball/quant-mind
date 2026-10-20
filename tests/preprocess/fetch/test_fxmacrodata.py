@@ -1,6 +1,7 @@
 """Tests for preprocess.fetch.fxmacrodata."""
 
 import unittest
+import traceback
 
 import httpx
 import respx
@@ -57,3 +58,81 @@ class FetchFxmacrodataCalendarTests(unittest.IsolatedAsyncioTestCase):
                 )
                 with self.assertRaises(ValueError):
                     await fetch_fxmacrodata_calendar(api_key=_KEY)
+
+    async def test_error_envelope_with_data_is_rejected(self):
+        with respx.mock() as router:
+            router.get(_URL).mock(
+                return_value=httpx.Response(
+                    200, json={"error": "failed", "data": []}
+                )
+            )
+            with self.assertRaises(ValueError):
+                await fetch_fxmacrodata_calendar(api_key=_KEY)
+
+    async def test_malformed_rows_are_not_silently_dropped(self):
+        with respx.mock() as router:
+            router.get(_URL).mock(
+                return_value=httpx.Response(
+                    200, json={"data": [{"release": "cpi"}, "invalid"]}
+                )
+            )
+            with self.assertRaises(ValueError):
+                await fetch_fxmacrodata_calendar(api_key=_KEY)
+
+    async def test_confirmation_requires_boolean_true(self):
+        with respx.mock() as router:
+            router.get(_URL).mock(
+                return_value=httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {"release_date_confirmed": value}
+                            for value in ["false", "true", 1, False, True]
+                        ]
+                    },
+                )
+            )
+            calendar = await fetch_fxmacrodata_calendar(api_key=_KEY)
+        self.assertEqual(
+            [row.release_date_confirmed for row in calendar.releases],
+            [False, False, False, False, True],
+        )
+
+    async def test_response_details_are_not_in_error(self):
+        with respx.mock() as router:
+            router.get(_URL).mock(
+                return_value=httpx.Response(
+                    200, json={"detail": "sensitive upstream text"}
+                )
+            )
+            with self.assertRaises(ValueError) as caught:
+                await fetch_fxmacrodata_calendar(api_key=_KEY)
+        self.assertNotIn("sensitive upstream text", str(caught.exception))
+
+    async def test_transport_traceback_is_sanitized(self):
+        with respx.mock() as router:
+            router.get(_URL).mock(
+                side_effect=httpx.ConnectError("sensitive upstream text")
+            )
+            try:
+                await fetch_fxmacrodata_calendar(api_key=_KEY)
+            except httpx.RequestError as error:
+                self.assertNotIn(
+                    "sensitive upstream text",
+                    "".join(traceback.format_exception(error)),
+                )
+            else:
+                self.fail("Expected transport failure")
+
+    async def test_control_character_key_rejected_before_request(self):
+        with self.assertRaises(ValueError):
+            await fetch_fxmacrodata_calendar(api_key="test\x00key")
+
+    async def test_non_json_response_is_sanitized(self):
+        with respx.mock() as router:
+            router.get(_URL).mock(
+                return_value=httpx.Response(200, content=b"invalid")
+            )
+            with self.assertRaises(ValueError) as caught:
+                await fetch_fxmacrodata_calendar(api_key=_KEY)
+        self.assertTrue(caught.exception.__suppress_context__)
